@@ -26,11 +26,14 @@ import {
   getAllTasks,
   putTask as dbPutTask,
   deleteTask as dbDeleteTask,
+  commitTaskDeletion,
   clearTasks as dbClearTasks,
   getAllAgentConversations,
+  putAgentConversation as dbPutAgentConversation,
   replaceAgentConversations,
   clearAgentConversations as dbClearAgentConversations,
   getImage,
+  getStoredImageThumbnail,
   getImageThumbnail,
   getAllImageIds,
   putImage,
@@ -660,12 +663,37 @@ function isImageReferencedByState(state: AppState, imageId: string) {
 }
 
 export async function deleteImageIfUnreferenced(imageId: string) {
-  deleteImageCacheEntry(imageId)
   if (isImageReferencedByState(useStore.getState(), imageId)) return
   try {
-    await deleteImage(imageId)
+    await deleteStoredImageIfUnreferenced(imageId)
   } catch {
     // 清理是内存/存储优化，失败不影响替换结果。
+  }
+}
+
+async function deleteStoredImageIfUnreferenced(imageId: string) {
+  if (isImageReferencedByState(useStore.getState(), imageId)) return
+  const [image, thumbnail] = await Promise.all([getImage(imageId), getStoredImageThumbnail(imageId)])
+  if (isImageReferencedByState(useStore.getState(), imageId)) return
+
+  await deleteImage(imageId)
+  if (!isImageReferencedByState(useStore.getState(), imageId)) {
+    deleteImageCacheEntry(imageId)
+    return
+  }
+
+  if (image) {
+    await putImage(image)
+    cacheImage(image.id, image.dataUrl)
+  }
+  if (thumbnail) {
+    await putImageThumbnail(thumbnail)
+    cacheThumbnail(thumbnail.id, {
+      dataUrl: thumbnail.thumbnailDataUrl,
+      width: thumbnail.width,
+      height: thumbnail.height,
+      thumbnailVersion: thumbnail.thumbnailVersion,
+    })
   }
 }
 
@@ -1655,6 +1683,7 @@ function clearFalRecoveryTimer(taskId: string) {
 
 function scheduleFalRecovery(taskId: string, delayMs = FAL_RECOVERY_POLL_MS) {
   if (falRecoveryTimers.has(taskId)) return
+  if (!useStore.getState().tasks.some((task) => task.id === taskId)) return
   const timer = setTimeout(() => {
     falRecoveryTimers.delete(taskId)
     recoverFalTask(taskId)
@@ -1670,6 +1699,7 @@ function clearCustomRecoveryTimer(taskId: string) {
 
 function scheduleCustomRecovery(taskId: string, delayMs = CUSTOM_RECOVERY_POLL_MS) {
   if (customRecoveryTimers.has(taskId)) return
+  if (!useStore.getState().tasks.some((task) => task.id === taskId)) return
   const timer = setTimeout(() => {
     customRecoveryTimers.delete(taskId)
     recoverCustomTask(taskId)
@@ -1811,6 +1841,7 @@ async function recoverFalTask(taskId: string) {
     await completeRecoveredFalTask(task, result)
     return
   } catch (err) {
+    if (!useStore.getState().tasks.some((item) => item.id === taskId)) return
     if (isNetworkRecoverableError(err)) {
       scheduleFalRecovery(taskId)
       return
@@ -2472,8 +2503,7 @@ async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
 
   for (const imgId of candidates) {
     if (stillUsed.has(imgId)) continue
-    await deleteImage(imgId)
-    deleteImageCacheEntry(imgId)
+    await deleteStoredImageIfUnreferenced(imgId)
   }
 }
 
@@ -2633,7 +2663,27 @@ function filterAgentRoundResponseOutputForInput(_round: AgentRound, _tasks: Task
   return output
 }
 
-function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: ResponsesOutputItem[], deletedTasks: TaskRecord[]) {
+function canonicalizeBatchFunctionCallArguments(output: ResponsesOutputItem[]) {
+  let changed = false
+  const canonical = output.map((item) => {
+    if (item.type !== 'function_call' || item.name !== 'generate_image_batch') return item
+    const batchItems = parseBatchImageCallArguments(item.arguments ?? '')
+    if (!batchItems) return item
+    try {
+      const parsed = JSON.parse(item.arguments ?? '{}')
+      if (!isRecord(parsed)) return item
+      const args = JSON.stringify({ ...parsed, images: batchItems })
+      if (args === item.arguments) return item
+      changed = true
+      return { ...item, arguments: args }
+    } catch {
+      return item
+    }
+  })
+  return changed ? canonical : output
+}
+
+function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: ResponsesOutputItem[], deletedTasks: TaskRecord[], roundTasks: TaskRecord[]) {
   const deletedTaskIds = new Set(deletedTasks.map((task) => task.id))
   const deletedToolCallIds = new Set(
     deletedTasks
@@ -2642,76 +2692,204 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
   )
   if (deletedTaskIds.size === 0) return output
 
-  let anonymousImageIndex = 0
-  return output.filter((item) => {
-    if (item.type !== 'image_generation_call') return true
+  const removedFunctionCallIds = new Set(
+    deletedTasks
+      .filter((task) => task.agentToolCallId && !task.agentBatchCallId)
+      .map((task) => task.agentToolCallId!),
+  )
+  const tasksById = new Map(roundTasks.map((task) => [task.id, task]))
+  const batchItemsByCallId = new Map<string, Array<{ id: string; prompt: string }>>()
+  for (const item of output) {
+    if (item.type !== 'function_call' || item.name !== 'generate_image_batch' || !item.call_id) continue
+    const batchItems = parseBatchImageCallArguments(item.arguments ?? '')
+    if (batchItems) batchItemsByCallId.set(item.call_id, batchItems)
+  }
+  const deletedBatchItemIds = new Map<string, Set<string>>()
+  const batchTasksByCallId = new Map<string, TaskRecord[]>()
+  for (const batchCallId of new Set(deletedTasks.map((task) => task.agentBatchCallId).filter((id): id is string => Boolean(id)))) {
+    const batchTasks = round.outputTaskIds
+      .map((taskId) => tasksById.get(taskId))
+      .filter((task): task is TaskRecord => task?.agentBatchCallId === batchCallId)
+    batchTasksByCallId.set(batchCallId, batchTasks)
+    if (batchTasks.length > 0 && batchTasks.every((task) => deletedTaskIds.has(task.id))) {
+      removedFunctionCallIds.add(batchCallId)
+      continue
+    }
+    const batchItemIds = (batchItemsByCallId.get(batchCallId) ?? []).map((item) => item.id)
+    const ids = new Set<string>()
+    for (let index = 0; index < batchTasks.length; index++) {
+      const task = batchTasks[index]
+      if (!deletedTaskIds.has(task.id)) continue
+      const itemId = batchItemIds.length === batchTasks.length ? batchItemIds[index] : task.agentBatchItemId
+      if (itemId) ids.add(itemId)
+    }
+    if (ids.size > 0) deletedBatchItemIds.set(batchCallId, ids)
+  }
 
-    if (typeof item.id === 'string' && item.id) {
-      return !deletedToolCallIds.has(item.id)
+  let imageIndex = 0
+  let changed = false
+  const scrubbed: ResponsesOutputItem[] = []
+  for (const item of output) {
+    if (item.type === 'image_generation_call') {
+      const taskId = round.outputTaskIds[imageIndex]
+      imageIndex += 1
+      if ((item.id && deletedToolCallIds.has(item.id)) || (!item.id && deletedTaskIds.has(taskId))) {
+        changed = true
+        continue
+      }
+      scrubbed.push(item)
+      continue
     }
 
-    const taskId = round.outputTaskIds[anonymousImageIndex]
-    anonymousImageIndex += 1
-    return !deletedTaskIds.has(taskId)
-  })
-}
+    const callId = item.call_id ?? ''
+    if (callId && removedFunctionCallIds.has(callId) && (item.type === 'function_call' || item.type === 'function_call_output')) {
+      changed = true
+      continue
+    }
 
-function scrubAgentConversationsForDeletedTasks(conversations: AgentConversation[], deletedTasks: TaskRecord[]) {
-  if (deletedTasks.length === 0) return conversations
+    const itemIds = callId ? deletedBatchItemIds.get(callId) : undefined
+    if (!itemIds?.size || (item.type !== 'function_call' && item.type !== 'function_call_output')) {
+      scrubbed.push(item)
+      continue
+    }
 
-  return conversations.map((conversation) => ({
-    ...conversation,
-    rounds: conversation.rounds.map((round) => {
-      const roundDeletedTasks = deletedTasks.filter((task) => round.outputTaskIds.includes(task.id))
-      if (roundDeletedTasks.length === 0 || !round.responseOutput?.length) return round
-      return {
-        ...round,
-        responseOutput: scrubResponseOutputForDeletedAgentTasks(round, round.responseOutput, roundDeletedTasks),
+    if (item.type === 'function_call') {
+      try {
+        const parsed = JSON.parse(item.arguments ?? '{}') as Record<string, unknown>
+        const batchItems = batchItemsByCallId.get(callId)
+        if (!batchItems) {
+          scrubbed.push(item)
+          continue
+        }
+        const args = JSON.stringify({ ...parsed, images: batchItems.filter((batchItem) => !itemIds.has(batchItem.id)) })
+        if (args === item.arguments) {
+          scrubbed.push(item)
+          continue
+        }
+        changed = true
+        scrubbed.push({ ...item, arguments: args })
+      } catch {
+        scrubbed.push(item)
       }
-    }),
-  }))
+      continue
+    }
+
+    try {
+      const parsed = JSON.parse(item.output ?? '{}') as { images?: unknown[] }
+      if (!Array.isArray(parsed.images)) {
+        scrubbed.push(item)
+        continue
+      }
+      const batchItems = batchItemsByCallId.get(callId)
+      const batchTasks = batchTasksByCallId.get(callId)
+      const canonicalImages = batchItems && batchTasks?.length === batchItems.length && parsed.images.length === batchItems.length
+        ? parsed.images.map((image, index) => isRecord(image) ? { ...image, id: batchItems[index].id } : image)
+        : parsed.images
+      const images = canonicalImages.filter((image) => !isRecord(image) || typeof image.id !== 'string' || !itemIds.has(image.id))
+      const value = JSON.stringify({ ...parsed, images })
+      if (value === item.output) {
+        scrubbed.push(item)
+        continue
+      }
+      changed = true
+      scrubbed.push({ ...item, output: value })
+    } catch {
+      scrubbed.push(item)
+    }
+  }
+  return changed ? scrubbed : output
 }
 
-function scrubTaskRawResponsePayloadForDeletedTasks(task: TaskRecord, conversations: AgentConversation[], deletedTasks: TaskRecord[]) {
-  if (!task.rawResponsePayload || !task.agentRoundId) return task
-
-  const round = conversations
-    .flatMap((conversation) => conversation.rounds)
-    .find((item) => item.id === task.agentRoundId)
-  if (!round) return task
-
-  const roundDeletedTasks = deletedTasks.filter((item) => item.agentRoundId === round.id)
-  if (roundDeletedTasks.length === 0) return task
+function scrubTaskRawResponsePayloadForDeletedTasks(task: TaskRecord, round: AgentRound, deletedTasks: TaskRecord[], roundTasks: TaskRecord[]) {
+  if (!task.rawResponsePayload) return task
 
   try {
     const payload = JSON.parse(task.rawResponsePayload) as ResponsesApiResponse
     if (!Array.isArray(payload.output)) return task
-    const output = scrubResponseOutputForDeletedAgentTasks(round, payload.output, roundDeletedTasks)
-    if (output.length === payload.output.length) return task
+    const output = scrubResponseOutputForDeletedAgentTasks(round, payload.output, deletedTasks, roundTasks)
+    if (output === payload.output) return task
     return { ...task, rawResponsePayload: JSON.stringify({ ...payload, output }, null, 2) }
   } catch {
     return task
   }
 }
 
-async function scrubAgentOutputPayloadsForDeletedTasks(deletedTasks: TaskRecord[]) {
-  if (deletedTasks.length === 0) return
+function scrubAgentOutputPayloadsForDeletedTasks(deletedTasks: TaskRecord[]) {
+  const deletedByRound = new Map<string, TaskRecord[]>()
+  const affectedConversationIds = new Set<string>()
+  for (const task of deletedTasks) {
+    if (task.sourceMode !== 'agent' || !task.agentConversationId || !task.agentRoundId) continue
+    const key = getAgentRoundControllerKey(task.agentConversationId, task.agentRoundId)
+    deletedByRound.set(key, [...(deletedByRound.get(key) ?? []), task])
+    affectedConversationIds.add(task.agentConversationId)
+  }
+  if (deletedByRound.size === 0) return { updatedTasks: [], updatedConversations: [] }
 
-  const updatedTaskIds = new Set<string>()
+  const updatedTasks: TaskRecord[] = []
+  const updatedConversations: AgentConversation[] = []
   useStore.setState((state) => {
-    const agentConversations = scrubAgentConversationsForDeletedTasks(state.agentConversations, deletedTasks)
-    const tasks = state.tasks.map((task) => {
-      const scrubbed = scrubTaskRawResponsePayloadForDeletedTasks(task, agentConversations, deletedTasks)
-      if (scrubbed.rawResponsePayload === task.rawResponsePayload) return task
-      updatedTaskIds.add(task.id)
-      return { ...task, rawResponsePayload: scrubbed.rawResponsePayload }
+    const tasksByRound = new Map<string, TaskRecord[]>()
+    for (const task of [...state.tasks, ...deletedTasks]) {
+      if (!task.agentConversationId || !task.agentRoundId) continue
+      const key = getAgentRoundControllerKey(task.agentConversationId, task.agentRoundId)
+      if (!deletedByRound.has(key)) continue
+      tasksByRound.set(key, [...(tasksByRound.get(key) ?? []), task])
+    }
+    const roundsByKey = new Map<string, AgentRound>()
+    let conversationsChanged = false
+    const agentConversations = state.agentConversations.map((conversation) => {
+      if (!affectedConversationIds.has(conversation.id)) return conversation
+      let changed = false
+      const rounds = conversation.rounds.map((round) => {
+        const key = getAgentRoundControllerKey(conversation.id, round.id)
+        const roundDeletedTasks = deletedByRound.get(key)
+        if (!roundDeletedTasks) return round
+        roundsByKey.set(key, round)
+        if (!round.responseOutput?.length) return round
+        const responseOutput = scrubResponseOutputForDeletedAgentTasks(round, round.responseOutput, roundDeletedTasks, tasksByRound.get(key) ?? roundDeletedTasks)
+        if (responseOutput === round.responseOutput) return round
+        changed = true
+        return { ...round, responseOutput }
+      })
+      if (!changed) return conversation
+      conversationsChanged = true
+      const updated = { ...conversation, rounds }
+      updatedConversations.push(updated)
+      return updated
     })
-    return { agentConversations, tasks }
+    const tasks = state.tasks.map((task) => {
+      if (!task.agentConversationId || !task.agentRoundId) return task
+      const key = getAgentRoundControllerKey(task.agentConversationId, task.agentRoundId)
+      const roundDeletedTasks = deletedByRound.get(key)
+      if (!roundDeletedTasks) return task
+      const round = roundsByKey.get(key)
+      if (!round) return task
+      const scrubbed = scrubTaskRawResponsePayloadForDeletedTasks(task, round, roundDeletedTasks, tasksByRound.get(key) ?? roundDeletedTasks)
+      if (scrubbed.rawResponsePayload === task.rawResponsePayload) return task
+      updatedTasks.push(scrubbed)
+      return scrubbed
+    })
+    if (!conversationsChanged && updatedTasks.length === 0) return state
+    return {
+      ...(conversationsChanged ? { agentConversations } : {}),
+      ...(updatedTasks.length > 0 ? { tasks } : {}),
+    }
   })
+  return { updatedTasks, updatedConversations }
+}
 
-  for (const taskId of updatedTaskIds) {
-    const task = useStore.getState().tasks.find((item) => item.id === taskId)
-    if (task) await putTask(task)
+async function persistTaskDeletionCleanup(deletedTaskIds: string[], cleanup: ReturnType<typeof scrubAgentOutputPayloadsForDeletedTasks>) {
+  const tasks = cleanup.updatedTasks.map(getPersistableTask)
+  const conversations = cleanup.updatedConversations.map(getPersistableAgentConversation)
+  try {
+    await commitTaskDeletion(deletedTaskIds, tasks, conversations)
+  } catch (err) {
+    console.warn('原子清理任务关联数据失败，改用逐项持久化', err)
+    await Promise.all([
+      ...deletedTaskIds.map((taskId) => dbDeleteTask(taskId)),
+      ...tasks.map((task) => dbPutTask(task)),
+      ...conversations.map((conversation) => dbPutAgentConversation(conversation)),
+    ])
   }
 }
 
@@ -3375,6 +3553,21 @@ async function executeAgentRound(
     const imageRequestSettings = createSettingsForApiProfile(requestSettings, imageProfile)
     const streamingTaskIds: string[] = resume ? [...round.outputTaskIds] : []
     const taskIdByToolCallId = new Map<string, string>()
+    const taskByToolCallId = new Map<string, TaskRecord>()
+
+    const getDeletedAgentTasks = () => {
+      const deletedTasks = getDeletedActiveAgentTasks(conversationId, roundId, controller)
+      const deletedTaskIds = new Set(deletedTasks.map((task) => task.id))
+      const currentTaskIds = new Set(useStore.getState().tasks.map((task) => task.id))
+      for (const [toolCallId, taskId] of taskIdByToolCallId) {
+        const task = taskByToolCallId.get(toolCallId)
+        if (task && !currentTaskIds.has(taskId) && !deletedTaskIds.has(taskId)) deletedTasks.push(task)
+      }
+      return deletedTasks
+    }
+    const getLatestRound = () => useStore.getState().agentConversations
+      .find((item) => item.id === conversationId)
+      ?.rounds.find((item) => item.id === roundId)
 
     const attachTaskToAgentRound = (taskId: string) => {
       if (streamingTaskIds.includes(taskId)) return
@@ -3399,7 +3592,7 @@ async function executeAgentRound(
       toolCallId: string,
       taskPrompt = '',
       inputImageIds = round.inputImageIds ?? [],
-      options: { createdAt?: number; agentBatchCallId?: string; maskTargetImageId?: string | null; maskImageId?: string | null; taskParams?: TaskParams } = {},
+      options: { createdAt?: number; agentBatchCallId?: string; agentBatchItemId?: string; maskTargetImageId?: string | null; maskImageId?: string | null; taskParams?: TaskParams } = {},
     ) => {
       const existingTaskId = taskIdByToolCallId.get(toolCallId)
       if (existingTaskId) return existingTaskId
@@ -3407,6 +3600,7 @@ async function executeAgentRound(
       const existingTask = useStore.getState().tasks.find((task) => task.agentToolCallId === toolCallId)
       if (existingTask) {
         taskIdByToolCallId.set(toolCallId, existingTask.id)
+        taskByToolCallId.set(toolCallId, existingTask)
         attachTaskToAgentRound(existingTask.id)
         return existingTask.id
       }
@@ -3435,9 +3629,11 @@ async function executeAgentRound(
         agentMessageId: assistantMessageId,
         agentToolCallId: toolCallId,
         ...(options.agentBatchCallId ? { agentBatchCallId: options.agentBatchCallId } : {}),
+        ...(options.agentBatchItemId ? { agentBatchItemId: options.agentBatchItemId } : {}),
       }
 
       taskIdByToolCallId.set(toolCallId, task.id)
+      taskByToolCallId.set(toolCallId, task)
       useStore.getState().setTasks([task, ...useStore.getState().tasks])
       attachTaskToAgentRound(task.id)
       await putTask(task)
@@ -3448,14 +3644,14 @@ async function executeAgentRound(
       const toolCallId = image.toolCallId ?? genId()
       const taskId = await ensureStreamingAgentTask(toolCallId)
       const latestTask = useStore.getState().tasks.find((task) => task.id === taskId)
-      if (latestTask?.status === 'done' && latestTask.outputImages.length > 0) return taskId
+      if (latestTask?.status === 'done' && latestTask.outputImages.length > 0) return { taskId, committed: true }
 
       const stored = await storeImageWithSize(image.dataUrl, 'generated')
       cacheImage(stored.id, image.dataUrl)
       const latestBeforeUpdate = useStore.getState().tasks.find((task) => task.id === taskId)
       if (!latestBeforeUpdate) {
         await deleteUnreferencedImageIds([stored.id])
-        return taskId
+        return { taskId, committed: false }
       }
       const actualParams: Partial<TaskParams> = {
         ...(Object.keys(image.actualParams ?? {}).length ? image.actualParams : {}),
@@ -3476,7 +3672,7 @@ async function executeAgentRound(
         agentToolAction: image.action,
       })
       useStore.getState().setTaskStreamPreview(taskId)
-      return taskId
+      return { taskId, committed: true }
     }
 
     const failAgentImageTask = (toolCallId: string, error: string, rawResponsePayload?: string) => {
@@ -3672,7 +3868,7 @@ async function executeAgentRound(
       }
     }
 
-    const executeSingleImageFunctionCall = async (functionCallItem: ResponsesOutputItem): Promise<string> => {
+    const executeSingleImageFunctionCall = async (functionCallItem: ResponsesOutputItem): Promise<string | null> => {
       const callId = functionCallItem.call_id ?? ''
       const item = parseSingleImageCallArguments(functionCallItem.arguments ?? '')
       if (!item) return JSON.stringify({ error: 'Invalid or empty image arguments' })
@@ -3711,9 +3907,12 @@ async function executeAgentRound(
 
         if (controller.signal.aborted) throw createAgentAbortError()
         if (result.image) {
-          await completeAgentImageTask({ ...result.image, toolCallId }, result.rawResponsePayload)
-          toolCallsUsed += 1
-          return JSON.stringify({ id: item.id, status: 'done' })
+          const completed = await completeAgentImageTask({ ...result.image, toolCallId }, result.rawResponsePayload)
+          if (completed.committed) {
+            toolCallsUsed += 1
+            return JSON.stringify({ id: item.id, status: 'done' })
+          }
+          return null
         }
 
         failAgentImageTask(toolCallId, result.error!, result.rawResponsePayload)
@@ -3755,13 +3954,14 @@ async function executeAgentRound(
           maskTargetImageId: null,
           maskImageId: null,
           ...(callId ? { agentBatchCallId: callId } : {}),
+          agentBatchItemId: item.id,
         })
         batchExecutionItems.push({ item, batchToolCallId, references, referenceIds, taskParams })
       }
 
       // Fire all batch items concurrently after all cards are visible.
       const batchPromises = batchExecutionItems.map(async ({ item, batchToolCallId, references, referenceIds, taskParams }) => {
-
+        let committed = false
         const batchResult = requestSettings.agentApiConfigMode === 'hybrid'
           ? {
               batchItemId: item.id,
@@ -3810,18 +4010,19 @@ async function executeAgentRound(
               onImageToolCompleted: shouldStreamAssistantMessage
                 ? async (image) => {
                     if (controller.signal.aborted) return
-                    await completeAgentImageTask({ ...image, toolCallId: batchToolCallId })
+                    committed = (await completeAgentImageTask({ ...image, toolCallId: batchToolCallId })).committed
                   }
                 : undefined,
             })
 
         if (controller.signal.aborted) throw createAgentAbortError()
         // If not streaming and we have an image, complete the pre-created task.
-        if (batchResult.image && !shouldStreamAssistantMessage) {
-          await completeAgentImageTask({ ...batchResult.image, toolCallId: batchToolCallId }, batchResult.rawResponsePayload)
+        if (batchResult.image && (requestSettings.agentApiConfigMode === 'hybrid' || !shouldStreamAssistantMessage)) {
+          committed = (await completeAgentImageTask({ ...batchResult.image, toolCallId: batchToolCallId }, batchResult.rawResponsePayload)).committed
         }
 
-        return batchResult
+        const latestTask = useStore.getState().tasks.find((task) => task.id === taskIdByToolCallId.get(batchToolCallId))
+        return { ...batchResult, committed: committed || Boolean(latestTask?.status === 'done' && latestTask.outputImages.length > 0) }
       })
 
       const batchResults = await Promise.allSettled(batchPromises)
@@ -3833,8 +4034,11 @@ async function executeAgentRound(
       for (let i = 0; i < batchItems.length; i++) {
         const settled = batchResults[i]
         const batchItem = batchItems[i]
+        const taskId = taskIdByToolCallId.get(batchExecutionItems[i].batchToolCallId)
+        if (!taskId || !useStore.getState().tasks.some((task) => task.id === taskId)) continue
         if (settled.status === 'fulfilled') {
           const r = settled.value
+          if (r.image && !r.committed) continue
           if (!r.image) {
             failAgentImageTask(batchExecutionItems[i].batchToolCallId, r.error!, r.rawResponsePayload)
           }
@@ -3892,10 +4096,10 @@ async function executeAgentRound(
         onOutputItems: shouldStreamAssistantMessage
           ? (outputItems) => {
               if (controller.signal.aborted) return
-              currentResponseOutputItems = outputItems
+              currentResponseOutputItems = canonicalizeBatchFunctionCallArguments(outputItems)
               updateAgentConversation(conversationId, (current) => ({
                 ...current,
-                rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, outputItems) } : item),
+                rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, currentResponseOutputItems) } : item),
               }))
             }
           : undefined,
@@ -3934,7 +4138,19 @@ async function executeAgentRound(
       if (controller.signal.aborted) throw createAgentAbortError()
 
       lastResponseId = result.responseId ?? lastResponseId
-      currentResponseOutputItems = currentResponseOutputItems.length ? currentResponseOutputItems : result.outputItems ?? []
+      currentResponseOutputItems = canonicalizeBatchFunctionCallArguments(
+        currentResponseOutputItems.length ? currentResponseOutputItems : result.outputItems ?? [],
+      )
+      const deletedTasks = getDeletedAgentTasks()
+      const currentRound = getLatestRound()
+      if (currentRound) {
+        currentResponseOutputItems = scrubResponseOutputForDeletedAgentTasks(
+          currentRound,
+          currentResponseOutputItems,
+          deletedTasks,
+          [...useStore.getState().tasks, ...deletedTasks],
+        )
+      }
       accumulatedOutputItems = mergeResponseOutputItems(accumulatedOutputItems, currentResponseOutputItems)
       updateAgentConversation(conversationId, (current) => ({
         ...current,
@@ -3954,7 +4170,9 @@ async function executeAgentRound(
       // Process built-in image_generation_call results (single images)
       for (const image of result.images) {
         if (image.toolCallId && taskIdByToolCallId.has(image.toolCallId)) {
-          const completedTaskId = await completeAgentImageTask(image, result.rawResponsePayload)
+          const completed = await completeAgentImageTask(image, result.rawResponsePayload)
+          if (!completed.committed) continue
+          const completedTaskId = completed.taskId
           const promptRefIds = uniqueIds(extractAgentReferenceIds(image.revisedPrompt ?? ''))
           if (promptRefIds.length > 0) {
             const promptRefs = await resolveReferenceImages(promptRefIds)
@@ -4041,6 +4259,7 @@ async function executeAgentRound(
       if (imageFunctionCalls.length > 0) {
         for (const fc of imageFunctionCalls) {
           const output = await executeSingleImageFunctionCall(fc)
+          if (output == null) continue
           functionCallOutputs.push({
             type: 'function_call_output',
             call_id: fc.call_id,
@@ -4068,8 +4287,27 @@ async function executeAgentRound(
         })
       }
 
+      const latestDeletedTasks = getDeletedAgentTasks()
+      const cleanedConversation = useStore.getState().agentConversations.find((item) => item.id === conversationId)
+      const latestRoundForCleanup = cleanedConversation?.rounds.find((item) => item.id === roundId)
+      const outputBeforeFunctionResults = latestRoundForCleanup?.responseOutput ?? accumulatedOutputItems
+      const mergedOutputItems = mergeResponseOutputItems(outputBeforeFunctionResults, functionCallOutputs)
+      const accumulatedOutputItemsWithFunctionOutputs = latestRoundForCleanup
+        ? scrubResponseOutputForDeletedAgentTasks(
+            latestRoundForCleanup,
+            mergedOutputItems,
+            latestDeletedTasks,
+            [...useStore.getState().tasks, ...latestDeletedTasks],
+          )
+        : mergedOutputItems
+      const generatedOutputCallIds = new Set(functionCallOutputs.map((item) => item.call_id).filter(Boolean))
+      const effectiveFunctionCallOutputs = accumulatedOutputItemsWithFunctionOutputs.filter(
+        (item) => item.type === 'function_call_output' && item.call_id && generatedOutputCallIds.has(item.call_id),
+      )
+
       // If no function calls need output → model decided the task is done → break
-      if (functionCallOutputs.length === 0) {
+      if (effectiveFunctionCallOutputs.length === 0) {
+        accumulatedOutputItems = accumulatedOutputItemsWithFunctionOutputs
         updateAgentConversation(conversationId, (current) => ({
           ...current,
           updatedAt: Date.now(),
@@ -4077,8 +4315,6 @@ async function executeAgentRound(
         }))
         break
       }
-
-      const accumulatedOutputItemsWithFunctionOutputs = mergeResponseOutputItems(accumulatedOutputItems, functionCallOutputs)
 
       updateAgentConversation(conversationId, (current) => ({
         ...current,
@@ -4095,17 +4331,20 @@ async function executeAgentRound(
       const latestConversation = useStore.getState().agentConversations.find((item) => item.id === conversationId)
       const latestRound = latestConversation?.rounds.find((item) => item.id === roundId)
       if (!latestRound) break
+      const continuationOutputItems = accumulatedOutputItemsWithFunctionOutputs.filter(
+        (item) => item.type !== 'function_call_output' || !item.call_id || !generatedOutputCallIds.has(item.call_id),
+      )
 
       const continuationBase = buildAgentContinuationInput(
         apiInput,
         latestRound,
         useStore.getState().tasks,
-        accumulatedOutputItems,
+        continuationOutputItems,
         toolCallsUsed,
         maxToolCalls,
       )
       // Insert function_call_output items before the continuation system message
-      continuationBase.splice(continuationBase.length - 1, 0, ...functionCallOutputs)
+      continuationBase.splice(continuationBase.length - 1, 0, ...effectiveFunctionCallOutputs)
       // Inject batch-generated images as input_image user message for model visibility
       const batchImagesItem = await createAgentBatchImagesInputItem(latestRound, useStore.getState().tasks, streamingTaskIds)
       if (batchImagesItem) continuationBase.splice(continuationBase.length - 1, 0, batchImagesItem)
@@ -4128,9 +4367,9 @@ async function executeAgentRound(
     const outputIds = taskIds.flatMap((taskId) => latestTasks.find((task) => task.id === taskId)?.outputImages ?? [])
     const latestConversation = useStore.getState().agentConversations.find((item) => item.id === conversationId)
     const latestRound = latestConversation?.rounds.find((item) => item.id === roundId)
-    const deletedTasks = getDeletedActiveAgentTasks(conversationId, roundId, controller)
+    const deletedTasks = getDeletedAgentTasks()
     const responseOutput = latestRound
-      ? scrubResponseOutputForDeletedAgentTasks(latestRound, accumulatedOutputItems, deletedTasks)
+      ? scrubResponseOutputForDeletedAgentTasks(latestRound, accumulatedOutputItems, deletedTasks, [...latestTasks, ...deletedTasks])
       : accumulatedOutputItems
     const limitNotice = reachedToolLimit ? `已达到最大工具调用次数（${maxToolCalls}），已停止自动续跑。` : ''
     const joinedText = textSegments.join('\n\n').trim()
@@ -4237,7 +4476,10 @@ async function executeAgentRound(
     }
     const deletedTasks = getDeletedActiveAgentTasks(conversationId, roundId, controller)
     try {
-      await scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
+      const cleanup = scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
+      if (cleanup.updatedTasks.length > 0 || cleanup.updatedConversations.length > 0) {
+        await persistTaskDeletionCleanup([], cleanup)
+      }
     } catch (err) {
       console.warn('清理已删除 Agent 任务的响应失败', err)
     } finally {
@@ -4414,8 +4656,8 @@ async function executeTask(taskId: string) {
     }
   } catch (err) {
     clearOpenAIWatchdogTimer(taskId)
-    const latestTask = useStore.getState().tasks.find((t) => t.id === taskId) ?? task
-    if (latestTask.status !== 'running') return
+    const latestTask = useStore.getState().tasks.find((t) => t.id === taskId)
+    if (!latestTask || latestTask.status !== 'running') return
     useStore.getState().setTaskStreamPreview(taskId)
     const latestFalRequestInfo = falRequestInfo ?? (latestTask.falRequestId && latestTask.falEndpoint
       ? { requestId: latestTask.falRequestId, endpoint: latestTask.falEndpoint }
@@ -4817,8 +5059,8 @@ async function removeTasks(taskIds: string[]) {
     clearOpenAIWatchdogTimer(task.id)
   }
 
-  await scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
-  for (const task of deletedTasks) await dbDeleteTask(task.id)
+  const cleanup = scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
+  await persistTaskDeletionCleanup(deletedTasks.map((task) => task.id), cleanup)
   await deleteUnreferencedImageIds(deletedImageIds)
   return deletedTasks.length
 }
@@ -4948,6 +5190,7 @@ async function recoverCustomTask(taskId: string) {
     await completeRecoveredCustomTask(task, result)
   } catch (err) {
     clearCustomRecoveryTimer(taskId)
+    if (!useStore.getState().tasks.some((item) => item.id === taskId)) return
     updateTaskInStore(taskId, {
       status: 'error',
       error: err instanceof Error ? err.message : String(err),

@@ -230,6 +230,8 @@ export interface TaskRecord {
   agentToolCallId?: string
   /** Agent 批量图像工具调用 ID */
   agentBatchCallId?: string
+  /** Agent 批量图像工具中的稳定条目 ID */
+  agentBatchItemId?: string
   /** Agent 图像工具实际动作 */
   agentToolAction?: 'generate' | 'edit' | 'auto' | string
 }
