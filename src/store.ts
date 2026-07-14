@@ -2678,11 +2678,11 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
       .map((task) => task.agentToolCallId!),
   )
   const tasksById = new Map(roundTasks.map((task) => [task.id, task]))
-  const batchItemIdsByCallId = new Map<string, string[]>()
+  const batchItemsByCallId = new Map<string, Array<{ id: string; prompt: string }>>()
   for (const item of output) {
     if (item.type !== 'function_call' || item.name !== 'generate_image_batch' || !item.call_id) continue
     const batchItems = parseBatchImageCallArguments(item.arguments ?? '')
-    if (batchItems) batchItemIdsByCallId.set(item.call_id, batchItems.map((batchItem) => batchItem.id))
+    if (batchItems) batchItemsByCallId.set(item.call_id, batchItems)
   }
   const deletedBatchItemIds = new Map<string, Set<string>>()
   for (const batchCallId of new Set(deletedTasks.map((task) => task.agentBatchCallId).filter((id): id is string => Boolean(id)))) {
@@ -2693,7 +2693,7 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
       removedFunctionCallIds.add(batchCallId)
       continue
     }
-    const batchItemIds = batchItemIdsByCallId.get(batchCallId) ?? []
+    const batchItemIds = (batchItemsByCallId.get(batchCallId) ?? []).map((item) => item.id)
     const ids = new Set<string>()
     for (let index = 0; index < batchTasks.length; index++) {
       const task = batchTasks[index]
@@ -2731,9 +2731,29 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
       continue
     }
 
+    if (item.type === 'function_call') {
+      try {
+        const parsed = JSON.parse(item.arguments ?? '{}') as Record<string, unknown>
+        const batchItems = batchItemsByCallId.get(callId)
+        if (!batchItems) {
+          scrubbed.push(item)
+          continue
+        }
+        const args = JSON.stringify({ ...parsed, images: batchItems.filter((batchItem) => !itemIds.has(batchItem.id)) })
+        if (args === item.arguments) {
+          scrubbed.push(item)
+          continue
+        }
+        changed = true
+        scrubbed.push({ ...item, arguments: args })
+      } catch {
+        scrubbed.push(item)
+      }
+      continue
+    }
+
     try {
-      const field = item.type === 'function_call' ? 'arguments' : 'output'
-      const parsed = JSON.parse(item[field] ?? '{}') as { images?: unknown[] }
+      const parsed = JSON.parse(item.output ?? '{}') as { images?: unknown[] }
       if (!Array.isArray(parsed.images)) {
         scrubbed.push(item)
         continue
@@ -2744,7 +2764,7 @@ function scrubResponseOutputForDeletedAgentTasks(round: AgentRound, output: Resp
         continue
       }
       changed = true
-      scrubbed.push({ ...item, [field]: JSON.stringify({ ...parsed, images }) })
+      scrubbed.push({ ...item, output: JSON.stringify({ ...parsed, images }) })
     } catch {
       scrubbed.push(item)
     }

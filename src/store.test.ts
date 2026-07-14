@@ -115,26 +115,19 @@ vi.mock('./lib/transparentImage', () => ({
   })),
   removeKeyedBackgroundFromDataUrl: vi.fn(async (dataUrl: string) => `transparent:${dataUrl}`),
 }))
-vi.mock('./lib/agentApi', () => ({
-  callAgentConversationTitleApi: vi.fn(async () => '标题'),
-  callAgentResponsesApi: vi.fn(() => new Promise(() => {})),
-  callBatchImageSingle: vi.fn(async (opts: { batchItemId: string; prompt: string }) => ({
-    batchItemId: opts.batchItemId,
-    image: { dataUrl: 'data:image/png;base64,batch-output', revisedPrompt: opts.prompt },
-    error: null,
-  })),
-  parseBatchImageCallArguments: vi.fn((args: string) => {
-    try {
-      const parsed = JSON.parse(args) as { images?: Array<{ id?: string; prompt?: string }> }
-      return parsed.images?.map((item, index) => ({
-        id: item.id || `image_${index + 1}`,
-        prompt: item.prompt || '',
-      })) ?? null
-    } catch {
-      return null
-    }
-  }),
-}))
+vi.mock('./lib/agentApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./lib/agentApi')>()
+  return {
+    ...actual,
+    callAgentConversationTitleApi: vi.fn(async () => '标题'),
+    callAgentResponsesApi: vi.fn(() => new Promise(() => {})),
+    callBatchImageSingle: vi.fn(async (opts: { batchItemId: string; prompt: string }) => ({
+      batchItemId: opts.batchItemId,
+      image: { dataUrl: 'data:image/png;base64,batch-output', revisedPrompt: opts.prompt },
+      error: null,
+    })),
+  }
+})
 import { clearAgentConversations, clearImages, clearTasks, commitTaskDeletion, deleteImage as deleteDbImage, getAllAgentConversations, getAllImageIds, getAllTasks, getImage, getStoredFreshImageThumbnail, putAgentConversation, putImage, putImageThumbnail, putTask as putDbTask } from './lib/db'
 import { callImageApi } from './lib/api'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
@@ -2957,6 +2950,7 @@ describe('agent built-in image tool failure', () => {
     await clearImages()
     await clearAgentConversations()
     vi.mocked(callAgentResponsesApi).mockClear()
+    vi.mocked(callImageApi).mockClear()
     useStore.setState({
       settings: normalizeSettings({
         ...DEFAULT_SETTINGS,
@@ -3098,6 +3092,71 @@ describe('agent built-in image tool failure', () => {
     expect(finalOutput).not.toContain('deleted-item')
     expect(finalOutput).toContain('live-item')
     expect(finalOutput).toContain('function_call_output')
+  })
+
+  it('uses normalized unique batch identities across tasks, arguments, and outputs', async () => {
+    const imageProfile = createDefaultOpenAIProfile({ id: 'image-profile', apiKey: 'image-key', apiMode: 'images' })
+    const requests = Array.from({ length: 4 }, () => deferred<Awaited<ReturnType<typeof callImageApi>>>())
+    useStore.setState({
+      settings: normalizeSettings({
+        ...useStore.getState().settings,
+        profiles: [responsesProfile, imageProfile],
+        activeProfileId: responsesProfile.id,
+        agentApiConfigMode: 'hybrid',
+        agentTextProfileId: responsesProfile.id,
+        agentImageProfileId: imageProfile.id,
+      }),
+    })
+    vi.mocked(callAgentResponsesApi)
+      .mockResolvedValueOnce({
+        text: '',
+        images: [],
+        outputItems: [{
+          type: 'function_call',
+          name: 'generate_image_batch',
+          call_id: 'normalized-batch-call',
+          arguments: JSON.stringify({ images: [
+            { id: ' duplicate ', prompt: ' deleted duplicate ' },
+            { id: 'duplicate', prompt: 'live duplicate' },
+            { id: '   ', prompt: 'blank id' },
+            { prompt: 'missing id' },
+            { id: 'ignored', prompt: '   ' },
+          ] }),
+        }],
+        responseId: 'response-normalized-batch',
+      })
+      .mockResolvedValueOnce({
+        text: 'complete',
+        images: [],
+        outputItems: [{ type: 'message', content: [{ type: 'output_text', text: 'complete' }] }],
+        responseId: 'response-normalized-complete',
+      })
+    for (const request of requests) vi.mocked(callImageApi).mockImplementationOnce(() => request.promise)
+
+    await submitAgentMessage()
+    await vi.waitFor(() => expect(useStore.getState().tasks.filter((item) => item.agentBatchCallId === 'normalized-batch-call')).toHaveLength(4))
+    await removeTask(useStore.getState().tasks.find((item) => item.agentBatchItemId === 'duplicate')!)
+    for (let index = 0; index < requests.length; index++) {
+      requests[index].resolve({
+        images: [`data:image/png;base64,normalized-${index}`],
+        actualParams: {},
+        actualParamsList: [{}],
+        revisedPrompts: [],
+      })
+    }
+
+    await vi.waitFor(() => expect(useStore.getState().agentConversations[0].rounds[0]?.status).toBe('done'))
+    expect(useStore.getState().tasks.map((item) => item.agentBatchItemId).sort()).toEqual(['duplicate_2', 'image_3', 'image_4'])
+    expect(callImageApi).toHaveBeenCalledTimes(4)
+    const output = useStore.getState().agentConversations[0].rounds[0].responseOutput ?? []
+    const functionCall = output.find((item) => item.type === 'function_call' && item.call_id === 'normalized-batch-call')
+    const functionOutput = output.find((item) => item.type === 'function_call_output' && item.call_id === 'normalized-batch-call')
+    expect(JSON.parse(functionCall?.arguments ?? '{}').images).toEqual([
+      { id: 'duplicate_2', prompt: 'live duplicate' },
+      { id: 'image_3', prompt: 'blank id' },
+      { id: 'image_4', prompt: 'missing id' },
+    ])
+    expect(JSON.parse(functionOutput?.output ?? '{}').images.map((item: { id: string }) => item.id)).toEqual(['duplicate_2', 'image_3', 'image_4'])
   })
 
   it('keeps live batch output through repeated cleanup when deleted items fail or reject', async () => {
