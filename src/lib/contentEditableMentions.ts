@@ -52,6 +52,7 @@ function getBoundaryOffsetInMention(tag: Element, container: Node, offset: numbe
     range.setEnd(container, offset)
     return range.toString().length
   } catch {
+    // contenteditable=false 的内部 Range 边界存在浏览器兼容差异
     return getMentionTagTextLength(tag)
   }
 }
@@ -80,7 +81,7 @@ function getContentEditableBoundaryOffset(
     // 根据父容器偏移量判断在输入框前后
     if (container.contains(root)) {
       const children = Array.from(container.childNodes)
-      const rootIndex = children.indexOf(root as any)
+      const rootIndex = children.indexOf(root)
       return offset <= rootIndex ? 0 : root.textContent?.length ?? 0
     }
     return edge === 'start' ? 0 : root.textContent?.length ?? 0
@@ -115,13 +116,9 @@ function getContentEditableBoundaryOffset(
 export function getContentEditableCursor(el: HTMLElement): number {
   const sel = window.getSelection()
   if (!sel || sel.rangeCount === 0) return el.textContent?.length ?? 0
-  try {
-    const range = sel.getRangeAt(0)
-    if (!el.contains(range.startContainer)) return el.textContent?.length ?? 0
-    return getContentEditableBoundaryOffset(el, range.startContainer, range.startOffset, 'start', range.collapsed)
-  } catch {
-    return el.textContent?.length ?? 0
-  }
+  const range = sel.getRangeAt(0)
+  if (!el.contains(range.startContainer)) return el.textContent?.length ?? 0
+  return getContentEditableBoundaryOffset(el, range.startContainer, range.startOffset, 'start', range.collapsed)
 }
 
 export function getContentEditableSelection(el: HTMLElement): { start: number; end: number } {
@@ -130,17 +127,12 @@ export function getContentEditableSelection(el: HTMLElement): { start: number; e
     const end = el.textContent?.length ?? 0
     return { start: end, end }
   }
-  try {
-    const range = sel.getRangeAt(0)
-    const start = getContentEditableBoundaryOffset(el, range.startContainer, range.startOffset, 'start', range.collapsed)
-    const end = range.collapsed
-      ? start
-      : getContentEditableBoundaryOffset(el, range.endContainer, range.endOffset, 'end', false)
-    return { start, end }
-  } catch {
-    const end = el.textContent?.length ?? 0
-    return { start: end, end }
-  }
+  const range = sel.getRangeAt(0)
+  const start = getContentEditableBoundaryOffset(el, range.startContainer, range.startOffset, 'start', range.collapsed)
+  const end = range.collapsed
+    ? start
+    : getContentEditableBoundaryOffset(el, range.endContainer, range.endOffset, 'end', false)
+  return { start, end }
 }
 
 export function getContentEditablePlainText(el: HTMLElement): string {
@@ -191,6 +183,7 @@ export function syncMentionTagSelection(el: HTMLElement) {
     try {
       isSelected = range.intersectsNode(tag)
     } catch {
+      // 分离节点等 Range 边界状态在不同浏览器中可能抛出异常
       isSelected = false
     }
     tag.classList.toggle('selected', isSelected)
